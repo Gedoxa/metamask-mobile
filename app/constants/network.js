@@ -35,6 +35,19 @@ export const NETWORKS_CHAIN_ID = {
   OPTIMISM_GOERLI: toHex('420'),
 };
 
+/**
+ * @enum {string}
+ */
+export const NETWORKS_CHAIN_ID_DECIMAL_STRING = {
+  MAINNET: '1',
+  OPTIMISM: '10',
+  BSC: '56',
+  POLYGON: '137',
+  ARBITRUM: '42161',
+  AVAXCCHAIN: '43114',
+  LINEA_MAINNET: '59144',
+};
+
 // To add a deprecation warning to a network, add it to the array
 export const DEPRECATED_NETWORKS = [
   NETWORKS_CHAIN_ID.GOERLI,
