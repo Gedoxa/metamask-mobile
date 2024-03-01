@@ -51,8 +51,9 @@ import {
   NetworkStatus,
 } from '@metamask/network-controller';
 import {
+  MaybeUpdateState,
   PhishingController,
-  PhishingState,
+  TestOrigin,
 } from '@metamask/phishing-controller';
 import {
   PreferencesController,
@@ -92,7 +93,6 @@ import SwapsController, { swapsUtils } from '@metamask/swaps-controller';
 import {
   PPOMController,
   PPOMControllerEvents,
-  PPOMInitialisationStatusType,
   PPOMState,
 } from '@metamask/ppom-validator';
 ///: BEGIN:ONLY_INCLUDE_IF(snaps)
@@ -125,10 +125,8 @@ import {
   LoggingControllerActions,
 } from '@metamask/logging-controller';
 import LedgerKeyring from '@consensys/ledgerhq-metamask-keyring';
-import Encryptor from './Encryptor';
 import {
   isMainnetByChainId,
-  getDecimalChainId,
   fetchEstimatedMultiLayerL1Fee,
 } from '../util/networks';
 import AppConstants from './AppConstants';
@@ -139,6 +137,7 @@ import {
   weiToFiatNumber,
   toHexadecimal,
   addHexPrefix,
+  SECOND,
 } from '../util/number';
 import NotificationManager from './NotificationManager';
 import Logger from '../util/Logger';
@@ -146,7 +145,6 @@ import Logger from '../util/Logger';
 import { EndowmentPermissions } from '../constants/permissions';
 ///: END:ONLY_INCLUDE_IF
 import { isZero } from '../util/lodash';
-import { MetaMetricsEvents, MetaMetrics } from './Analytics';
 
 ///: BEGIN:ONLY_INCLUDE_IF(snaps)
 import {
@@ -160,6 +158,7 @@ import {
 import { getRpcMethodMiddleware } from './RPCMethods/RPCMethodMiddleware';
 ///: END:ONLY_INCLUDE_IF
 import { isBlockaidFeatureEnabled } from '../util/blockaid';
+import { encryptorFactory } from '../util/encryptor-factory';
 import {
   getCaveatSpecifications,
   getPermissionSpecifications,
@@ -185,20 +184,9 @@ import { UpdatePPOMInitializationStatus } from '../actions/experimental';
 
 const NON_EMPTY = 'NON_EMPTY';
 
-const encryptor = new Encryptor();
 let currentChainId: any;
 
 ///: BEGIN:ONLY_INCLUDE_IF(snaps)
-// TODO remove these custom types when the PhishingController is to version >= 7.0.0
-interface MaybeUpdateState {
-  type: `${PhishingController['name']}:maybeUpdateState`;
-  handler: PhishingController['maybeUpdateState'];
-}
-
-interface TestOrigin {
-  type: `${PhishingController['name']}:testOrigin`;
-  handler: PhishingController['test'];
-}
 type PhishingControllerActions = MaybeUpdateState | TestOrigin;
 
 type SnapsGlobalActions =
@@ -254,7 +242,7 @@ export interface EngineState {
   KeyringController: KeyringControllerState;
   NetworkController: NetworkState;
   PreferencesController: PreferencesState;
-  PhishingController: PhishingState;
+  PhishingController: PhishingController;
   TokenBalancesController: TokenBalancesState;
   TokenRatesController: TokenRatesState;
   TransactionController: TransactionState;
@@ -347,15 +335,8 @@ class Engine {
     this.controllerMessenger = new ControllerMessenger();
 
     const approvalController = new ApprovalController({
-      // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'ApprovalController',
-        never,
-        never
-      >({
+      messenger: this.controllerMessenger.getRestricted({
         name: 'ApprovalController',
-        allowedEvents: [],
-        allowedActions: [],
       }),
       showApprovalRequest: () => undefined,
       typesExcludedFromRateLimiting: [
@@ -376,68 +357,67 @@ class Engine {
           initialState?.PreferencesController?.useTokenDetection ?? true,
         // TODO: Use previous value when preferences UI is available
         useNftDetection: false,
-        displayNftMedia: true,
         securityAlertsEnabled: true,
       },
     );
 
+    const networkControllerMessenger = this.controllerMessenger.getRestricted({
+      name: 'NetworkController',
+    });
     const networkControllerOpts = {
       infuraProjectId: process.env.MM_INFURA_PROJECT_ID || NON_EMPTY,
-      state: initialState.NetworkController,
-      messenger: this.controllerMessenger.getRestricted<
-        'NetworkController',
-        never,
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-ignore // TODO: fix this type mismatch after the base-controller version is updated
-        'NetworkController:networkDidChange'
-      >({
-        name: 'NetworkController',
-        allowedEvents: ['NetworkController:networkDidChange'],
-        allowedActions: [],
-      }),
+      state: initialState.NetworkController || {},
+      messenger: networkControllerMessenger,
       // Metrics event tracking is handled in this repository instead
       // TODO: Use events for controller metric events
       trackMetaMetricsEvent: () => {
         // noop
       },
     };
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
     const networkController = new NetworkController(networkControllerOpts);
 
     networkController.initializeProvider();
 
-    const assetsContractController = new AssetsContractController({
-      onPreferencesStateChange: (listener) =>
-        preferencesController.subscribe(listener),
-      onNetworkStateChange: (listener) =>
-        this.controllerMessenger.subscribe(
-          AppConstants.NETWORK_STATE_CHANGE_EVENT,
-          listener,
-        ),
-      chainId: networkController.state.providerConfig.chainId,
+    const assetsContractController = new AssetsContractController(
+      {
+        chainId: networkController.state.providerConfig.chainId,
+        onPreferencesStateChange: (listener) =>
+          preferencesController.subscribe(listener),
+        onNetworkDidChange: (cb) =>
+          networkControllerMessenger.subscribe(
+            'NetworkController:networkDidChange',
+            () => {
+              const networkState = networkController.state;
+              return cb(networkState);
+            },
+          ),
+        getNetworkClientById:
+          networkController.getNetworkClientById.bind(networkController),
+      },
+      {
+        provider: networkController.getProviderAndBlockTracker().provider,
+      },
+      initialState.AssetsContractController,
+    );
+
+    const nftControllerMessenger = this.controllerMessenger.getRestricted({
+      name: 'NftController',
+      allowedActions: [`${approvalController.name}:addRequest`],
     });
 
     const nftController = new NftController(
       {
-        onPreferencesStateChange: (listener) =>
-          preferencesController.subscribe(listener),
-        onNetworkStateChange: (listener) =>
+        chainId: networkController.state.providerConfig.chainId,
+        messenger: nftControllerMessenger,
+        onPreferencesStateChange: preferencesController.subscribe.bind(
+          preferencesController,
+        ),
+        onNetworkStateChange: (listener) => {
           this.controllerMessenger.subscribe(
             AppConstants.NETWORK_STATE_CHANGE_EVENT,
             listener,
-          ),
-        // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-        messenger: this.controllerMessenger.getRestricted<
-          'NftController',
-          'ApprovalController:addRequest',
-          never
-        >({
-          name: 'NftController',
-          allowedActions: [`${approvalController.name}:addRequest`],
-        }),
-        chainId: networkController.state.providerConfig.chainId,
-
+          );
+        },
         getERC721AssetName: assetsContractController.getERC721AssetName.bind(
           assetsContractController,
         ),
@@ -457,38 +437,14 @@ class Engine {
         getERC1155TokenURI: assetsContractController.getERC1155TokenURI.bind(
           assetsContractController,
         ),
+        getNetworkClientById:
+          networkController.getNetworkClientById.bind(networkController),
       },
       {
         useIPFSSubdomains: false,
-        chainId: networkController.state.providerConfig.chainId,
       },
+      initialState.NftController,
     );
-    const tokensController = new TokensController({
-      onPreferencesStateChange: (listener) =>
-        preferencesController.subscribe(listener),
-      onNetworkStateChange: (listener) =>
-        this.controllerMessenger.subscribe(
-          AppConstants.NETWORK_STATE_CHANGE_EVENT,
-          listener,
-        ),
-      chainId: networkController.state.providerConfig.chainId,
-      config: {
-        provider: networkController.getProviderAndBlockTracker().provider,
-        chainId: networkController.state.providerConfig.chainId,
-      },
-      // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'TokensController',
-        'ApprovalController:addRequest',
-        never
-      >({
-        name: 'TokensController',
-        allowedActions: [`${approvalController.name}:addRequest`],
-      }),
-      getERC20TokenName: assetsContractController.getERC20TokenName.bind(
-        assetsContractController,
-      ),
-    });
 
     const tokenListController = new TokenListController({
       chainId: networkController.state.providerConfig.chainId,
@@ -497,49 +453,76 @@ class Engine {
           AppConstants.NETWORK_STATE_CHANGE_EVENT,
           listener,
         ),
-      // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'TokenListController',
-        never,
-        'NetworkController:stateChange'
-      >({
+      messenger: this.controllerMessenger.getRestricted({
         name: 'TokenListController',
         allowedEvents: ['NetworkController:stateChange'],
       }),
     });
-    const currencyRateController = new CurrencyRateController({
-      // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'CurrencyRateController',
-        never,
-        never
-      >({
-        name: 'CurrencyRateController',
+
+    const tokensController = new TokensController({
+      onPreferencesStateChange: (listener) =>
+        preferencesController.subscribe(listener),
+      onNetworkDidChange: (cb) =>
+        networkControllerMessenger.subscribe(
+          'NetworkController:networkDidChange',
+          () => {
+            const networkState = networkController.state;
+            return cb(networkState);
+          },
+        ),
+      onTokenListStateChange: (listener) =>
+        this.controllerMessenger.subscribe(
+          `${tokenListController.name}:stateChange`,
+          listener,
+        ),
+      getNetworkClientById:
+        networkController.getNetworkClientById.bind(networkController),
+      chainId: networkController.state.providerConfig.chainId,
+      config: {
+        provider: networkController.getProviderAndBlockTracker().provider,
+        chainId: networkController.state.providerConfig.chainId,
+      },
+      messenger: this.controllerMessenger.getRestricted({
+        name: 'TokensController',
+        allowedActions: [`${approvalController.name}:addRequest`],
       }),
+      state: initialState.TokensController,
+    });
+
+    const currencyRateMessenger = this.controllerMessenger.getRestricted({
+      name: 'CurrencyRateController',
+      allowedActions: [`${networkController.name}:getNetworkClientById`],
+    });
+
+    const currencyRateController = new CurrencyRateController({
+      includeUsdRate: true,
+      messenger: currencyRateMessenger,
       state: initialState.CurrencyRateController,
     });
-    currencyRateController.start();
+
+    const gasFeeMessenger = this.controllerMessenger.getRestricted({
+      name: 'GasFeeController',
+      allowedActions: [
+        'NetworkController:getEIP1559Compatibility',
+        'NetworkController:getNetworkClientById',
+        'NetworkController:getState',
+      ],
+      allowedEvents: ['NetworkController:stateChange'],
+    });
 
     const gasFeeController = new GasFeeController({
-      // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'GasFeeController',
-        never,
-        'NetworkController:stateChange'
-      >({
-        name: 'GasFeeController',
-        allowedEvents: ['NetworkController:stateChange'],
-      }),
+      messenger: gasFeeMessenger,
       getProvider: () =>
         // @ts-expect-error at this point in time the provider will be defined by the `networkController.initializeProvider`
         networkController.getProviderAndBlockTracker().provider,
-      onNetworkStateChange: (listener) =>
-        this.controllerMessenger.subscribe(
-          AppConstants.NETWORK_STATE_CHANGE_EVENT,
-          listener,
-        ),
+      onNetworkDidChange: (listener) => {
+        networkControllerMessenger.subscribe(
+          'NetworkController:networkDidChange',
+          () => listener(networkController.state),
+        );
+      },
       getCurrentNetworkEIP1559Compatibility: async () =>
-        await networkController.getEIP1559Compatibility(),
+        !!(await networkController.getEIP1559Compatibility()),
       getChainId: () => networkController.state.providerConfig.chainId,
       getCurrentNetworkLegacyGasAPICompatibility: () => {
         const chainId = networkController.state.providerConfig.chainId;
@@ -556,7 +539,16 @@ class Engine {
         'https://gas-api.metaswap.codefi.network/networks/<chain_id>/suggestedGasFees',
     });
 
-    const phishingController = new PhishingController();
+    const phishingControllerMessenger = this.controllerMessenger.getRestricted({
+      name: 'PhishingController',
+    });
+
+    const phishingController = new PhishingController({
+      messenger: phishingControllerMessenger,
+      state: initialState.PhishingController,
+      hotlistRefreshInterval: process.env.IN_TEST ? 5 * SECOND : undefined,
+      stalelistRefreshInterval: process.env.IN_TEST ? 30 * SECOND : undefined,
+    });
     phishingController.maybeUpdateState();
 
     const getIdentities = () => {
@@ -574,6 +566,10 @@ class Engine {
     const ledgerKeyringBuilder = () => new LedgerKeyring();
     ledgerKeyringBuilder.type = LedgerKeyring.type;
 
+    const keyringControllerMessenger = this.controllerMessenger.getRestricted({
+      name: 'KeyringController',
+    });
+
     const keyringController = new KeyringController({
       removeIdentity: preferencesController.removeIdentity.bind(
         preferencesController,
@@ -590,15 +586,8 @@ class Engine {
       setAccountLabel: preferencesController.setAccountLabel.bind(
         preferencesController,
       ),
-      encryptor,
-      // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'KeyringController',
-        never,
-        never
-      >({
-        name: 'KeyringController',
-      }),
+      encryptor: encryptorFactory(600_000),
+      messenger: keyringControllerMessenger,
       state: initialKeyringState || initialState.KeyringController,
       // @ts-expect-error To Do: Update the type of QRHardwareKeyring to Keyring<Json>
       keyringBuilders: [qrKeyringBuilder, ledgerKeyringBuilder],
@@ -629,8 +618,8 @@ class Engine {
       ...buildSnapRestrictedMethodSpecifications(
         Object.keys(ExcludedSnapPermissions),
         {
-          encrypt: encryptor.encrypt.bind(encryptor),
-          decrypt: encryptor.decrypt.bind(encryptor),
+          encrypt: encryptorFactory(10_000).encrypt,
+          decrypt: encryptorFactory(10_000).decrypt,
           // eslint-disable-next-line @typescript-eslint/ban-ts-comment
           // @ts-ignore
           clearSnapState: this.controllerMessenger.call.bind(
@@ -675,11 +664,7 @@ class Engine {
           isOnPhishingList: (origin: string) =>
             this.controllerMessenger.call<'PhishingController:testOrigin'>(
               'PhishingController:testOrigin',
-              // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-              // @ts-ignore
               origin,
-              // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-              // @ts-ignore
             ).result,
           showDialog: (
             origin: string,
@@ -706,8 +691,6 @@ class Engine {
     ///: END:ONLY_INCLUDE_IF
 
     const permissionController = new PermissionController({
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
       messenger: this.controllerMessenger.getRestricted({
         name: 'PermissionController',
         allowedActions: [
@@ -739,13 +722,7 @@ class Engine {
 
     ///: BEGIN:ONLY_INCLUDE_IF(snaps)
     const subjectMetadataController = new SubjectMetadataController({
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-      messenger: this.controllerMessenger.getRestricted<
-        'SubjectMetadataController',
-        'PermissionController:hasPermissions',
-        never
-      >({
+      messenger: this.controllerMessenger.getRestricted({
         name: 'SubjectMetadataController',
         allowedActions: [`${permissionController.name}:hasPermissions`],
       }),
@@ -901,6 +878,9 @@ class Engine {
     const controllers = [
       keyringController,
       new AccountTrackerController({
+        messenger: this.controllerMessenger.getRestricted({
+          name: 'AccountTrackerController',
+        }),
         onPreferencesStateChange: (listener) =>
           preferencesController.subscribe(listener),
         getIdentities: () => preferencesController.state.identities,
@@ -916,37 +896,26 @@ class Engine {
       tokensController,
       tokenListController,
       new TokenDetectionController({
+        messenger: this.controllerMessenger.getRestricted({
+          name: 'TokenDetectionController',
+          allowedActions: [
+            `${networkController.name}:getNetworkClientById`,
+            `${networkController.name}:getNetworkConfigurationByNetworkClientId`,
+          ],
+          allowedEvents: [
+            'NetworkController:stateChange',
+            'KeyringController:lock',
+            'KeyringController:unlock',
+            'TokenListController:stateChange',
+            'NetworkController:networkDidChange',
+          ],
+        }),
+        networkClientId: networkController.state.providerConfig.chainId,
         onPreferencesStateChange: (listener) =>
           preferencesController.subscribe(listener),
-        onNetworkStateChange: (listener) =>
-          this.controllerMessenger.subscribe(
-            AppConstants.NETWORK_STATE_CHANGE_EVENT,
-            listener,
-          ),
-        onTokenListStateChange: (listener) =>
-          this.controllerMessenger.subscribe(
-            `${tokenListController.name}:stateChange`,
-            listener,
-          ),
-        addDetectedTokens: async (tokens) => {
-          // Track detected tokens event
-          MetaMetrics.getInstance().trackEvent(
-            MetaMetricsEvents.TOKEN_DETECTED,
-            {
-              token_standard: 'ERC20',
-              asset_type: 'token',
-              chain_id: getDecimalChainId(
-                networkController.state.providerConfig.chainId,
-              ),
-            },
-          );
-          tokensController.addDetectedTokens(tokens);
-        },
-        updateTokensName: (tokenList) =>
-          tokensController.updateTokensName(tokenList),
+        addDetectedTokens:
+          tokensController.addDetectedTokens.bind(tokensController),
         getTokensState: () => tokensController.state,
-        getTokenListState: () => tokenListController.state,
-        getNetworkState: () => networkController.state,
         getPreferencesState: () => preferencesController.state,
         getBalancesInSingleCall:
           assetsContractController.getBalancesInSingleCall.bind(
@@ -954,19 +923,22 @@ class Engine {
           ),
       }),
       new NftDetectionController({
-        onNftsStateChange: (listener) => nftController.subscribe(listener),
-        onPreferencesStateChange: (listener) =>
-          preferencesController.subscribe(listener),
-        onNetworkStateChange: (listener) =>
-          this.controllerMessenger.subscribe(
-            AppConstants.NETWORK_STATE_CHANGE_EVENT,
-            listener,
-          ),
         chainId: networkController.state.providerConfig.chainId,
+        onNftsStateChange: (listener) => nftController.subscribe(listener),
+        onPreferencesStateChange: preferencesController.subscribe.bind(
+          preferencesController,
+        ),
+        onNetworkStateChange: (listener) =>
+          networkControllerMessenger.subscribe(
+            'NetworkController:networkDidChange',
+            () => listener(networkController.state),
+          ),
         getOpenSeaApiKey: () => nftController.openSeaApiKey,
         addNft: nftController.addNft.bind(nftController),
         getNftApi: nftController.getNftApi.bind(nftController),
         getNftState: () => nftController.state,
+        getNetworkClientById:
+          networkController.getNetworkClientById.bind(networkController),
       }),
       currencyRateController,
       networkController,
@@ -983,21 +955,35 @@ class Engine {
         },
         { interval: 10000 },
       ),
-      new TokenRatesController({
-        onTokensStateChange: (listener) => tokensController.subscribe(listener),
-        onNetworkStateChange: (listener) =>
-          this.controllerMessenger.subscribe(
-            AppConstants.NETWORK_STATE_CHANGE_EVENT,
-            listener,
-          ),
-        onPreferencesStateChange: (listener) =>
-          preferencesController.subscribe(listener),
-        chainId: networkController.state.providerConfig.chainId,
-        ticker: networkController.state.providerConfig.ticker ?? 'ETH',
-        selectedAddress: preferencesController.state.selectedAddress,
-        tokenPricesService: codefiTokenApiV2,
-        interval: 30 * 60 * 1000,
-      }),
+
+      new TokenRatesController(
+        {
+          messenger: this.controllerMessenger.getRestricted({
+            name: 'TokenRatesController',
+          }),
+          onTokensStateChange: (listener) =>
+            tokensController.subscribe(listener),
+          onNetworkStateChange: (listener) =>
+            this.controllerMessenger.subscribe(
+              AppConstants.NETWORK_STATE_CHANGE_EVENT,
+              listener,
+            ),
+          onPreferencesStateChange: (listener) =>
+            preferencesController.subscribe(listener),
+          chainId: networkController.state.providerConfig.chainId,
+          ticker: networkController.state.providerConfig.ticker ?? 'ETH',
+          selectedAddress: preferencesController.state.selectedAddress,
+          getNetworkClientById:
+            networkController.getNetworkClientById.bind(networkController),
+          tokenPricesService: codefiTokenApiV2,
+          interval: 30 * 60 * 1000,
+        },
+        {
+          allTokens: tokensController.state.allTokens,
+          allDetectedTokens: tokensController.state.allDetectedTokens,
+        },
+        initialState.TokenRatesController,
+      ),
       new TransactionController({
         // @ts-expect-error at this point in time the provider will be defined by the `networkController.initializeProvider`
         blockTracker:
@@ -1006,7 +992,6 @@ class Engine {
         getNetworkState: () => networkController.state,
         getSelectedAddress: () => preferencesController.state.selectedAddress,
         incomingTransactions: {
-          apiKey: process.env.MM_ETHERSCAN_KEY,
           isEnabled: () => {
             const currentHexChainId =
               networkController.state.providerConfig.chainId;
@@ -1018,19 +1003,19 @@ class Engine {
           },
           updateTransactions: true,
         },
-        // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-        messenger: this.controllerMessenger.getRestricted<
-          'TransactionController',
-          'ApprovalController:addRequest',
-          never
-        >({
+        messenger: this.controllerMessenger.getRestricted({
           name: 'TransactionController',
-          allowedActions: [`${approvalController.name}:addRequest`],
+          allowedActions: [
+            `${approvalController.name}:addRequest`,
+            'NetworkController:findNetworkClientIdByChainId',
+            'NetworkController:getNetworkClientById',
+          ],
+          allowedEvents: [`NetworkController:stateChange`],
         }),
         onNetworkStateChange: (listener) =>
-          this.controllerMessenger.subscribe(
-            AppConstants.NETWORK_STATE_CHANGE_EVENT,
-            listener,
+          networkControllerMessenger.subscribe(
+            'NetworkController:networkDidChange',
+            () => listener(networkController.state),
           ),
         // @ts-expect-error at this point in time the provider will be defined by the `networkController.initializeProvider`
         provider: networkController.getProviderAndBlockTracker().provider,
@@ -1066,14 +1051,14 @@ class Engine {
       approvalController,
       permissionController,
       new SignatureController({
-        // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-        messenger: this.controllerMessenger.getRestricted<
-          'SignatureController',
-          'ApprovalController:addRequest',
-          never
-        >({
+        messenger: this.controllerMessenger.getRestricted({
           name: 'SignatureController',
-          allowedActions: [`${approvalController.name}:addRequest`],
+          allowedActions: [
+            `${approvalController.name}:addRequest`,
+            `${keyringController.name}:signMessage`,
+            `${keyringController.name}:signPersonalMessage`,
+            `${keyringController.name}:signTypedMessage`,
+          ],
         }),
         isEthSignEnabled: () =>
           Boolean(
@@ -1081,33 +1066,28 @@ class Engine {
           ),
         getAllState: () => store.getState(),
         getCurrentChainId: () => networkController.state.providerConfig.chainId,
-        keyringController: {
-          signMessage: keyringController.signMessage.bind(keyringController),
-          signPersonalMessage:
-            keyringController.signPersonalMessage.bind(keyringController),
-          signTypedMessage: (msgParams, { version }) => {
-            if (
-              isHardwareAccount(msgParams.from, [ExtendedKeyringTypes.ledger])
-            ) {
-              return ledgerSignTypedMessage(
-                msgParams,
-                version as SignTypedDataVersion,
-              );
-            }
-            return keyringController.signTypedMessage(
-              msgParams,
-              version as SignTypedDataVersion,
-            );
-          },
-        },
+        // keyringController: {
+        //   signMessage: keyringController.signMessage.bind(keyringController),
+        //   signPersonalMessage:
+        //     keyringController.signPersonalMessage.bind(keyringController),
+        //   signTypedMessage: (msgParams, { version }) => {
+        //     if (
+        //       isHardwareAccount(msgParams.from, [ExtendedKeyringTypes.ledger])
+        //     ) {
+        //       return ledgerSignTypedMessage(
+        //         msgParams,
+        //         version as SignTypedDataVersion,
+        //       );
+        //     }
+        //     return keyringController.signTypedMessage(
+        //       msgParams,
+        //       version as SignTypedDataVersion,
+        //     );
+        //   },
+        // },
       }),
       new LoggingController({
-        // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-        messenger: this.controllerMessenger.getRestricted<
-          'LoggingController',
-          never,
-          never
-        >({
+        messenger: this.controllerMessenger.getRestricted({
           name: 'LoggingController',
         }),
         state: initialState.LoggingController,
@@ -1121,29 +1101,21 @@ class Engine {
     if (isBlockaidFeatureEnabled()) {
       try {
         const ppomController = new PPOMController({
-          chainId: networkController.state.providerConfig.chainId,
-          blockaidPublicKey: process.env.BLOCKAID_PUBLIC_KEY as string,
-          cdnBaseUrl: process.env.BLOCKAID_FILE_CDN as string,
-          // @ts-expect-error TODO: Resolve/patch mismatch between base-controller versions. Before: never, never. Now: string, string, which expects 3rd and 4th args to be informed for restrictedControllerMessengers
-          messenger: this.controllerMessenger.getRestricted<
-            'PPOMController',
-            never,
-            'NetworkController:stateChange'
-          >({
+          messenger: this.controllerMessenger.getRestricted({
             name: 'PPOMController',
             allowedEvents: ['NetworkController:stateChange'],
           }),
-          onPreferencesChange: (listener) =>
-            preferencesController.subscribe(listener),
-          provider: networkController.getProviderAndBlockTracker().provider,
-          ppomProvider: {
-            PPOM,
-            ppomInit,
-          },
           storageBackend: new RNFSStorageBackend('PPOMDB'),
+          provider: networkController.getProviderAndBlockTracker().provider,
+          ppomProvider: { PPOM, ppomInit },
+          state: initialState.PPOMController,
+          chainId: networkController.state.providerConfig.chainId,
           securityAlertsEnabled:
             initialState.PreferencesController?.securityAlertsEnabled ?? false,
-          state: initialState.PPOMController,
+          onPreferencesChange: (listener) =>
+            preferencesController.subscribe(listener),
+          cdnBaseUrl: process.env.BLOCKAID_FILE_CDN as string,
+          blockaidPublicKey: process.env.BLOCKAID_PUBLIC_KEY as string,
           nativeCrypto: Crypto as any,
         });
         controllers.push(ppomController as any);
