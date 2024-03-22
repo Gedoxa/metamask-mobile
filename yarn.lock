@@ -4534,8 +4534,10 @@
   resolved "https://registry.yarnpkg.com/@metamask/slip44/-/slip44-3.1.0.tgz#f8067796f89fbbd6eaa594660bd6a1fbd6837a51"
   integrity sha512-bFlJ8jhTYJ4iQ0zgh2WMO2615UJ4Ne5J831EjsqKYaZs3qd6UTw/cy76hAmSxhnBluNAH5S6zZzxESLrTitCmQ==
 
-"@metamask/smart-transactions-controller@file:.yalc/@metamask/smart-transactions-controller":
-  version "6.2.2-3"
+"@metamask/smart-transactions-controller@7.0.0":
+  version "7.0.0"
+  resolved "https://registry.yarnpkg.com/@metamask/smart-transactions-controller/-/smart-transactions-controller-7.0.0.tgz#e11006fea3ea09f37f52644e7867a089b3c1fe9c"
+  integrity sha512-oTqAHFGaKNfvVnInrEc+re/JdYXR3e9AjJkPruq+/5eGfNh65vHrQ9FKHKKN/5GrNwHjCsWhJzBb414EOAq3jw==
   dependencies:
     "@ethereumjs/tx" "^5.2.1"
     "@ethereumjs/util" "^9.0.2"
@@ -28274,6 +28276,7 @@ wordwrap@^1.0.0:
   integrity sha512-gvVzJFlPycKc5dZN4yPkP8w7Dc37BtP1yczEneOb4uq34pXZcvrtRTmWV8W+Ume+XCxKgbjM+nevkyFPMybd4Q==
 
 "wrap-ansi-cjs@npm:wrap-ansi@^7.0.0", wrap-ansi@^7.0.0:
+  name wrap-ansi-cjs
   version "7.0.0"
   resolved "https://registry.yarnpkg.com/wrap-ansi/-/wrap-ansi-7.0.0.tgz#67e145cff510a6a6984bdf1152911d69d2eb9e43"
   integrity sha512-YVGIj2kamLSTxw6NsZjoBxfSwsn0ycdesmc4p+Q21c5zPuZ1pl+NfxVdxPtdHvmNVOQ6XSYG4AUtyt/Fi7D16Q==
