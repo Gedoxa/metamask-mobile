@@ -228,13 +228,45 @@ const RootRPCMethodsUI = (props) => {
         // For Ledger Accounts we handover the signing to the confirmation flow
         if (isLedgerAccount) {
           const ledgerKeyring = await getLedgerKeyring();
-
           props.navigation.navigate(
             ...createLedgerTransactionModalNavDetails({
               transactionId: transactionMeta.id,
               deviceId: ledgerKeyring.deviceId,
               // eslint-disable-next-line no-empty-function
-              onConfirmationComplete: () => {},
+              onConfirmationComplete: () => {
+                const transactions = TransactionController.state.transactions;
+                const submittedTransaction = transactions?.find(
+                  (tx) => tx.status === 'submitted',
+                );
+                Logger.log(
+                  'transactions',
+                  transactions.length,
+                  submittedTransaction,
+                );
+                TransactionController.hub.once(
+                  `${submittedTransaction.id}:finished`,
+                  (transactionMeta) => {
+                    Logger.log('transaction finished', transactionMeta.id);
+                  },
+                );
+                TransactionController.hub.once(
+                  `${submittedTransaction.id}:confirmed`,
+                  (transactionMeta) => {
+                    Logger.log('transaction confirmed', transactionMeta.id);
+                  },
+                );
+                setTimeout(() => {
+                  props.navigation.navigate(
+                    ...createLedgerTransactionModalNavDetails({
+                      transactionId: submittedTransaction.id,
+                      deviceId: ledgerKeyring.deviceId,
+                      // eslint-disable-next-line no-empty-function
+                      onConfirmationComplete: () => {},
+                      type: 'signTransaction',
+                    }),
+                  );
+                }, 2000);
+              },
               type: 'signTransaction',
             }),
           );
